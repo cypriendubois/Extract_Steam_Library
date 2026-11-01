@@ -142,9 +142,25 @@ def _b64url_decode(segment: str) -> bytes:
     return base64.urlsafe_b64decode(segment + padding)
 
 
+def normalize_refresh_token(value: Optional[str]) -> Optional[str]:
+    """Strip the ``steamid||`` prefix Steam uses in the refresh cookie.
+
+    ``steamRefresh_steam`` is set to ``<steamid>||<jwt>``.  The prefix must
+    not be sent back as the ``nonce`` to ``jwt/finalizelogin``.
+    """
+    if not value:
+        return value
+    value = unquote(value).strip()
+    if "||" in value:
+        prefix, token = value.split("||", 1)
+        if prefix.isdigit() and token:
+            return token
+    return value
+
+
 def decode_jwt(token: str) -> dict:
     """Return a JWT payload without verifying the signature."""
-    parts = (token or "").split(".")
+    parts = (normalize_refresh_token(token) or "").split(".")
     if len(parts) < 2:
         return {}
     try:
@@ -617,7 +633,7 @@ def mint_web_token(
     auth: dict, auth_file: str = DEFAULT_AUTH_FILE
 ) -> tuple[str, requests.Session, str]:
     """Return ``(webapi_token, store_session, steamid)`` for an auth record."""
-    refresh_token = auth.get("refresh_token")
+    refresh_token = normalize_refresh_token(auth.get("refresh_token"))
     if not refresh_token:
         raise AuthError("auth file has no refresh_token. Run `python steam_auth.py`.")
     steamid = str(
@@ -630,8 +646,9 @@ def mint_web_token(
     finalize_login(session, refresh_token, steamid)
 
     # Steam may rotate the refresh token when finalizing a web session.
-    rotated = _cookie_value(
-        session, "steamRefresh_steam", "store.steampowered.com"
+    # The cookie value is "steamid||jwt"; keep only the JWT.
+    rotated = normalize_refresh_token(
+        _cookie_value(session, "steamRefresh_steam", "store.steampowered.com")
     )
     if (
         rotated
@@ -673,14 +690,18 @@ def save_auth(auth: dict, path: str = DEFAULT_AUTH_FILE) -> Path:
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    refresh_token = normalize_refresh_token(auth.get("refresh_token"))
+    if not refresh_token:
+        raise AuthError("Cannot save auth without a refresh token.")
+
     payload = {
         "version": 1,
-        "refresh_token": auth["refresh_token"],
+        "refresh_token": refresh_token,
         "steamid": str(auth["steamid"]),
         "account_name": auth.get("account_name"),
         "created_at": auth.get("created_at") or _now_iso(),
         "refresh_token_expires_at": auth.get("refresh_token_expires_at")
-        or _expiry_iso(auth["refresh_token"]),
+        or _expiry_iso(refresh_token),
     }
 
     temporary = path.with_name(path.name + ".tmp")
@@ -712,11 +733,22 @@ def load_auth(path: str = DEFAULT_AUTH_FILE) -> Optional[dict]:
             f"{path} is not a valid auth file. Run `python steam_auth.py`."
         )
 
-    if not payload.get("refresh_token") or not payload.get("steamid"):
+    raw_refresh_token = payload.get("refresh_token")
+    refresh_token = normalize_refresh_token(raw_refresh_token)
+    if not refresh_token or not payload.get("steamid"):
         raise AuthError(
             f"{path} is missing refresh_token/steamid. "
             "Run `python steam_auth.py` to create it."
         )
+
+    # Older versions saved the raw steamRefresh_steam cookie, which is
+    # "steamid||jwt". Repair the file in place so later runs are clean.
+    if refresh_token != raw_refresh_token:
+        payload["refresh_token"] = refresh_token
+        try:
+            save_auth(payload, str(path))
+        except OSError:
+            pass
 
     try:
         if path.stat().st_mode & 0o077:
@@ -813,7 +845,7 @@ def run_login(
         handle_password_confirmations(session, begin, code=code)
         result = poll_auth(session, begin, timeout=timeout, quiet=quiet)
 
-    refresh_token = result.get("refresh_token")
+    refresh_token = normalize_refresh_token(result.get("refresh_token"))
     if not refresh_token:
         raise AuthError("Steam did not return a refresh token. Login failed.")
 

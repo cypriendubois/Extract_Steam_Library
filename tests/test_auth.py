@@ -17,6 +17,7 @@ from steam_auth import (  # noqa: E402
     encrypt_password,
     is_refresh_token,
     load_auth,
+    normalize_refresh_token,
     save_auth,
     steamid_from_token,
     token_expiry,
@@ -52,6 +53,17 @@ class JwtTests(unittest.TestCase):
         access = make_jwt({"sub": "1", "aud": ["web:store"], "exp": 9999999999})
         self.assertTrue(is_refresh_token(refresh))
         self.assertFalse(is_refresh_token(access))
+
+    def test_normalize_refresh_token(self):
+        token = make_jwt({"sub": "76561198000000000", "aud": ["derive"]})
+        self.assertEqual(normalize_refresh_token(token), token)
+        self.assertEqual(
+            normalize_refresh_token(f"76561198000000000||{token}"), token
+        )
+        self.assertEqual(
+            normalize_refresh_token(f"76561198000000000%7C%7C{token}"), token
+        )
+        self.assertIsNone(normalize_refresh_token(None))
 
 
 class PasswordEncryptionTests(unittest.TestCase):
@@ -93,6 +105,30 @@ class AuthFileTests(unittest.TestCase):
             self.assertEqual(loaded["steamid"], "76561198000000000")
             self.assertEqual(loaded["account_name"], "tester")
             self.assertEqual(loaded["refresh_token"], refresh)
+
+    def test_load_repairs_prefixed_refresh_token(self):
+        steamid = "76561198000000000"
+        token = make_jwt(
+            {"sub": steamid, "aud": ["derive"], "exp": 9999999999}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "refresh_token": f"{steamid}||{token}",
+                        "steamid": steamid,
+                    }
+                )
+            )
+
+            loaded = load_auth(str(path))
+
+            self.assertEqual(loaded["refresh_token"], token)
+            on_disk = json.loads(path.read_text())
+            self.assertEqual(on_disk["refresh_token"], token)
 
     def test_missing_file_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
